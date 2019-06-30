@@ -1,0 +1,9 @@
+[package]
+name = "smteepee"
+version = "0.1.0"
+authors = ["wakka <fungus.humungus@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+tokio = "0.1"
+
