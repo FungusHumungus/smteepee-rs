@@ -25,6 +25,15 @@ pub struct Smtp<T> {
 }
 
 impl<T> Smtp<T> {
+    pub fn new(config: Config, socket: Framed<T, LinesCodec>) -> Self {
+        Smtp {
+            config,
+            socket,
+            state: (true, State::SendGreeting),
+            message: None,
+        }
+    }
+
     /// Creates a message if there isn't one.
     fn set_message(&mut self) {
         if self.message.is_none() {
@@ -36,7 +45,7 @@ impl<T> Smtp<T> {
         self.set_message();
 
         match self.message.as_mut() {
-            Some(m) => m.from = Some(from),
+            Some(m) => m.from = Some(from.replace("MAIL FROM:", "")),
             None => {}
         }
     }
@@ -140,4 +149,104 @@ where
             }
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use crate::config::Config;
+    use crate::dummy_socket::DummySocket;
+    use crate::smtp::Smtp;
+    use std::sync::mpsc;
+    use tokio::codec::{Framed, LinesCodec};
+    use tokio::prelude::*;
+
+    /// Convenience function to create the Smtp future that receives
+    /// the given data from the socket.
+    fn create_socket_with(data: &str, sender: mpsc::Sender<Vec<u8>>) -> Smtp<DummySocket> {
+        let socket = DummySocket::new_with_channel(data.into(), sender);
+        let framed = Framed::new(socket, LinesCodec::new());
+        Smtp::new(
+            Config {
+                domain: "groove.com".to_string(),
+            },
+            framed,
+        )
+    }
+
+    #[test]
+    fn test_greeting() {
+        let (sender, receiver) = mpsc::channel();
+        let smtp = create_socket_with("HELO\n", sender);
+        tokio::run(
+            smtp.map(move |_| {
+                assert_eq!(
+                    "220 local ESMTP smteepee\n",
+                    String::from_utf8(receiver.recv().unwrap()).unwrap()
+                )
+            })
+            .map_err(|err| eprintln!("{:?}", err)),
+        );
+    }
+
+    #[test]
+    fn test_from() {
+        let (sender, receiver) = mpsc::channel();
+        let smtp = create_socket_with("HELO\nMAIL FROM:ponk.com", sender);
+        tokio::run(
+            smtp.map(move |msg| {
+                // The initial greeting message.
+                assert_eq!(
+                    "220 local ESMTP smteepee\n",
+                    String::from_utf8(receiver.recv().unwrap()).unwrap()
+                );
+                // 250 OK is returned when we send a from.
+                assert_eq!(
+                    "250 OK\n",
+                    String::from_utf8(receiver.recv().unwrap()).unwrap()
+                );
+                assert_eq!(Some(Some("ponk.com".to_string())), msg.map(|m| m.from));
+            })
+            .map_err(|err| eprintln!("{:?}", err)),
+        );
+    }
+
+    #[test]
+    fn test_rcpt() {
+        let (sender, receiver) = mpsc::channel();
+        let smtp = create_socket_with(
+            "HELO\nRCPT TO:onk@ponk.com\nRCPT TO:pook@ook.co.uk\n",
+            sender,
+        );
+        tokio::run(
+            smtp.map(move |msg| {
+                assert_eq!(
+                    "220 local ESMTP smteepee\n",
+                    String::from_utf8(receiver.recv().unwrap()).unwrap()
+                );
+
+                // 250 OK is returned when we send a recipient.
+                // We get two of them as there are two recipients.
+                assert_eq!(
+                    "250 OK\n",
+                    String::from_utf8(receiver.recv().unwrap()).unwrap()
+                );
+                assert_eq!(
+                    "250 OK\n",
+                    String::from_utf8(receiver.recv().unwrap()).unwrap()
+                );
+
+                assert_eq!(
+                    Some(vec![
+                        "onk@ponk.com".to_string(),
+                        "pook@ook.co.uk".to_string(),
+                    ]),
+                    msg.map(|m| m.to)
+                );
+
+            })
+            .map_err(|err| eprintln!("{:?}", err)),
+        );
+    }
+
 }

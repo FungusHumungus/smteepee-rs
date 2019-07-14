@@ -11,6 +11,9 @@ mod config;
 mod message;
 mod smtp;
 
+#[cfg(test)]
+mod dummy_socket;
+
 fn main() {
     let addr = "127.0.0.1:2525".parse().unwrap();
     let listener = TcpListener::bind(&addr).expect("Unable to listen");
@@ -22,14 +25,12 @@ fn main() {
         .for_each(|socket| {
             let framed = Framed::new(socket, LinesCodec::new());
 
-            let handle = smtp::Smtp {
-                config: config::Config {
+            let handle = smtp::Smtp::new(
+                config::Config {
                     domain: "groove.com".to_string(),
                 },
-                socket: framed,
-                state: (true, smtp::State::SendGreeting),
-                message: None,
-            };
+                framed,
+            );
 
             tokio::spawn(
                 handle
@@ -38,9 +39,10 @@ fn main() {
                         // Error if it hasn't
                         match message {
                             Some(message) => future::ok(message),
-                            None => {
-                                future::err(io::Error::new(io::ErrorKind::Other, "No message created"))
-                            }
+                            None => future::err(io::Error::new(
+                                io::ErrorKind::Other,
+                                "No message created",
+                            )),
                         }
                     })
                     .and_then(|message| {
