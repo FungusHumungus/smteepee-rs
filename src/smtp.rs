@@ -1,8 +1,8 @@
-use std::io;
-use tokio::prelude::*;
-use tokio::codec::{Framed, LinesCodec};
 use crate::config::Config;
 use crate::message::Message;
+use std::io;
+use tokio::codec::{Framed, LinesCodec};
+use tokio::prelude::*;
 
 #[derive(Clone, Copy)]
 pub enum State {
@@ -15,31 +15,14 @@ pub enum State {
     End,
 }
 
-
+/// A struct that implements Future that is responsible for the dialog
+/// between client and server to receive an SMTP message.
 pub struct Smtp<T> {
     pub config: Config,
     pub socket: Framed<T, LinesCodec>,
     pub state: (bool, State),
     pub message: Option<Message>,
 }
-
-
-
-/// A macro to simplify the code when matching in our poll function.
-/// This needs to be a macro because the result returns if NotReady,
-/// and just continues if it is Ready.
-macro_rules! ready {
-    ( $x:expr ) => {
-        {
-            match $x {
-                Async::NotReady => return Ok(Async::NotReady),
-                Async::Ready(res) => res,
-            }
-        }
-    }
-}
-
-
 
 impl<T> Smtp<T> {
     /// Creates a message if there isn't one.
@@ -77,8 +60,6 @@ impl<T> Smtp<T> {
     }
 }
 
-
-
 impl<T> Future for Smtp<T>
 where
     T: AsyncRead + AsyncWrite,
@@ -86,6 +67,8 @@ where
     type Item = Option<Message>;
     type Error = io::Error;
 
+    /// poll implements a state machine that handles the various states that
+    /// occur whilst receiving an SMTP message.
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         loop {
             match &self.state {
@@ -94,7 +77,7 @@ where
                         .start_send("220 local ESMTP smteepee".to_string())?;
                     self.state = (false, State::ReceiveGreeting);
                 }
-                (true, State::ReceiveGreeting) => match ready!(self.socket.poll()?) {
+                (true, State::ReceiveGreeting) => match try_ready!(self.socket.poll()) {
                     Some(ref msg) if msg.starts_with("HELO") => {
                         self.state = (false, State::Accepted);
                     }
@@ -108,7 +91,7 @@ where
                     self.socket.start_send(message)?;
                     self.state = (false, State::Accept);
                 }
-                (true, State::Accept) => match ready!(self.socket.poll()?) {
+                (true, State::Accept) => match try_ready!(self.socket.poll()) {
                     Some(msg) => {
                         if msg.starts_with("MAIL FROM:") {
                             self.set_from(msg);
@@ -131,7 +114,7 @@ where
                     }
                     _ => self.state = (false, State::Rejected),
                 },
-                (true, State::AcceptData) => match ready!(self.socket.poll()?) {
+                (true, State::AcceptData) => match try_ready!(self.socket.poll()) {
                     Some(msg) => {
                         if msg == "." {
                             self.socket
@@ -151,21 +134,10 @@ where
                     return Ok(Async::Ready(self.message.take()));
                 }
                 (false, state) => {
-                    ready!(self.socket.poll_complete()?);
+                    try_ready!(self.socket.poll_complete());
                     self.state = (true, state.clone());
                 }
             }
         }
     }
 }
-
-impl Message {
-    fn new() -> Self {
-        Message {
-            from: None,
-            to: Vec::new(),
-            data: Vec::new(),
-        }
-    }
-}
-
