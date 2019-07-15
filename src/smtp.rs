@@ -15,12 +15,17 @@ pub enum State {
     End,
 }
 
+pub enum PollComplete {
+    Yes,
+    No,
+}
+
 /// A struct that implements Future that is responsible for the dialog
 /// between client and server to receive an SMTP message.
 pub struct Smtp<T> {
     pub config: Config,
     pub socket: Framed<T, LinesCodec>,
-    pub state: (bool, State),
+    pub state: (PollComplete, State),
     pub message: Option<Message>,
 }
 
@@ -29,7 +34,7 @@ impl<T> Smtp<T> {
         Smtp {
             config,
             socket,
-            state: (true, State::SendGreeting),
+            state: (PollComplete::No, State::SendGreeting),
             message: None,
         }
     }
@@ -54,7 +59,7 @@ impl<T> Smtp<T> {
         self.set_message();
 
         match self.message.as_mut() {
-            Some(m) => m.to.push(to),
+            Some(m) => m.to.push(to.replace("RCPT TO:", "")),
             None => {}
         }
     }
@@ -81,70 +86,79 @@ where
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         loop {
             match &self.state {
-                (true, State::SendGreeting) => {
+                (PollComplete::No, State::SendGreeting) => {
                     self.socket
                         .start_send("220 local ESMTP smteepee".to_string())?;
-                    self.state = (false, State::ReceiveGreeting);
+                    self.state = (PollComplete::Yes, State::ReceiveGreeting);
                 }
-                (true, State::ReceiveGreeting) => match try_ready!(self.socket.poll()) {
-                    Some(ref msg) if msg.starts_with("HELO") => {
-                        self.state = (false, State::Accepted);
+
+                (PollComplete::No, State::ReceiveGreeting) => {
+                    match try_ready!(self.socket.poll()) {
+                        Some(ref msg) if msg.starts_with("HELO") => {
+                            self.state = (PollComplete::No, State::Accepted);
+                        }
+                        _ => self.state = (PollComplete::No, State::Rejected),
                     }
-                    _ => self.state = (false, State::Rejected),
-                },
-                (true, State::Accepted) => {
+                }
+
+                (PollComplete::No, State::Accepted) => {
                     let message = format!(
                         "250 {}, I hope this day finds you well.",
                         self.config.domain
                     );
                     self.socket.start_send(message)?;
-                    self.state = (false, State::Accept);
+                    self.state = (PollComplete::Yes, State::Accept);
                 }
-                (true, State::Accept) => match try_ready!(self.socket.poll()) {
+
+                (PollComplete::No, State::Accept) => match try_ready!(self.socket.poll()) {
                     Some(msg) => {
                         if msg.starts_with("MAIL FROM:") {
                             self.set_from(msg);
                             self.socket.start_send("250 OK".to_string())?;
-                            self.state = (false, State::Accept);
+                            self.state = (PollComplete::Yes, State::Accept);
                         } else if msg.starts_with("RCPT TO:") {
                             self.set_rcpt(msg);
                             self.socket.start_send("250 OK".to_string())?;
-                            self.state = (false, State::Accept);
+                            self.state = (PollComplete::Yes, State::Accept);
                         } else if msg.starts_with("DATA") {
                             self.socket
                                 .start_send("354 End data with <CR><LF>.<CR><LF>".to_string())?;
-                            self.state = (false, State::AcceptData);
+                            self.state = (PollComplete::Yes, State::AcceptData);
                         } else if msg.starts_with("QUIT") {
                             self.socket.start_send("221 Bye".to_string())?;
-                            self.state = (false, State::End);
+                            self.state = (PollComplete::Yes, State::End);
                         } else {
-                            self.state = (false, State::Rejected);
+                            self.state = (PollComplete::No, State::Rejected);
                         }
                     }
-                    _ => self.state = (false, State::Rejected),
+                    _ => self.state = (PollComplete::No, State::Rejected),
                 },
-                (true, State::AcceptData) => match try_ready!(self.socket.poll()) {
+
+                (PollComplete::No, State::AcceptData) => match try_ready!(self.socket.poll()) {
                     Some(msg) => {
                         if msg == "." {
                             self.socket
                                 .start_send("250 Ok: queued as plork".to_string())?;
-                            self.state = (false, State::Accept);
+                            self.state = (PollComplete::Yes, State::Accept);
                         } else {
                             self.set_body(msg);
                         }
                     }
                     _ => {}
                 },
-                (true, State::Rejected) => {
+
+                (PollComplete::No, State::Rejected) => {
                     self.socket.start_send("Error".to_string())?;
-                    self.state = (false, State::End);
+                    self.state = (PollComplete::Yes, State::End);
                 }
-                (true, State::End) => {
+
+                (PollComplete::No, State::End) => {
                     return Ok(Async::Ready(self.message.take()));
                 }
-                (false, state) => {
+
+                (PollComplete::Yes, state) => {
                     try_ready!(self.socket.poll_complete());
-                    self.state = (true, state.clone());
+                    self.state = (PollComplete::No, state.clone());
                 }
             }
         }
@@ -200,6 +214,11 @@ mod tests {
                     "220 local ESMTP smteepee\n",
                     String::from_utf8(receiver.recv().unwrap()).unwrap()
                 );
+                // The accept message.
+                assert_eq!(
+                    "250 groove.com, I hope this day finds you well.\n",
+                    String::from_utf8(receiver.recv().unwrap()).unwrap()
+                );
                 // 250 OK is returned when we send a from.
                 assert_eq!(
                     "250 OK\n",
@@ -224,7 +243,11 @@ mod tests {
                     "220 local ESMTP smteepee\n",
                     String::from_utf8(receiver.recv().unwrap()).unwrap()
                 );
-
+                // The accept message.
+                assert_eq!(
+                    "250 groove.com, I hope this day finds you well.\n",
+                    String::from_utf8(receiver.recv().unwrap()).unwrap()
+                );
                 // 250 OK is returned when we send a recipient.
                 // We get two of them as there are two recipients.
                 assert_eq!(
@@ -243,7 +266,6 @@ mod tests {
                     ]),
                     msg.map(|m| m.to)
                 );
-
             })
             .map_err(|err| eprintln!("{:?}", err)),
         );

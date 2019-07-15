@@ -4,7 +4,7 @@ use std::sync::mpsc;
 
 
 /// The DummySocket is used in testing to simulate a connection to a server.
-/// It impluments the AsyncRead and AsyncWrite traits.
+/// It implements the AsyncRead and AsyncWrite traits.
 /// Data passed to it is the data that is received from the simulated server.
 /// Data sent to the server is stored in the recieved variable and optionally sent 
 /// through the given mspc channel once the data is flushed.
