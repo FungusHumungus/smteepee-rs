@@ -6,10 +6,15 @@ use tokio::prelude::*;
 
 #[macro_use]
 extern crate futures;
+#[macro_use]
+extern crate lazy_static;
 
 mod config;
 mod message;
+mod commands;
+mod responses;
 mod smtp;
+
 
 #[cfg(test)]
 mod dummy_socket;
@@ -23,6 +28,9 @@ fn main() {
     let server = incoming
         .map_err(|e| eprintln!("Accept failed = {:?}", e))
         .for_each(|socket| {
+            
+            // TODO : SMTP line endings are CRLF.
+            // We are going to need to create our own Codec that can handle this specifically.
             let framed = Framed::new(socket, LinesCodec::new());
 
             let handle = smtp::Smtp::new(

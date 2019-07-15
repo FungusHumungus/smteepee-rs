@@ -1,5 +1,7 @@
+use crate::commands::Command;
 use crate::config::Config;
 use crate::message::Message;
+use crate::responses::Response;
 use std::io;
 use tokio::codec::{Framed, LinesCodec};
 use tokio::prelude::*;
@@ -8,7 +10,6 @@ use tokio::prelude::*;
 pub enum State {
     SendGreeting,
     ReceiveGreeting,
-    Accepted,
     Rejected,
     Accept,
     AcceptData,
@@ -50,7 +51,7 @@ impl<T> Smtp<T> {
         self.set_message();
 
         match self.message.as_mut() {
-            Some(m) => m.from = Some(from.replace("MAIL FROM:", "")),
+            Some(m) => m.from = Some(from),
             None => {}
         }
     }
@@ -59,7 +60,7 @@ impl<T> Smtp<T> {
         self.set_message();
 
         match self.message.as_mut() {
-            Some(m) => m.to.push(to.replace("RCPT TO:", "")),
+            Some(m) => m.to.push(to),
             None => {}
         }
     }
@@ -71,6 +72,13 @@ impl<T> Smtp<T> {
             Some(m) => m.data.push(data),
             None => {}
         }
+    }
+
+    fn respond(&mut self, response: Response) -> Result<AsyncSink<String>, io::Error>
+    where
+        T: AsyncRead + AsyncWrite,
+    {
+        self.socket.start_send(response.as_string())
     }
 }
 
@@ -87,58 +95,70 @@ where
         loop {
             match &self.state {
                 (PollComplete::No, State::SendGreeting) => {
-                    self.socket
-                        .start_send("220 local ESMTP smteepee".to_string())?;
+                    // Send the initial greeting.
+                    self.respond(Response::_220_ServiceReady("smteepee"))?;
                     self.state = (PollComplete::Yes, State::ReceiveGreeting);
                 }
 
                 (PollComplete::No, State::ReceiveGreeting) => {
+                    // The first command we must recieve must be an EHLO or a HELO command.
+                    // Then if it is correct we can get on with the main command loop.
                     match try_ready!(self.socket.poll()) {
-                        Some(ref msg) if msg.starts_with("HELO") => {
-                            self.state = (PollComplete::No, State::Accepted);
-                        }
+                        Some(ref msg) => match Command::from_str(msg) {
+                            Some(Command::HELO(_)) | Some(Command::EHLO(_)) => {
+                                self.respond(Response::_250_Completed(&format!(
+                                    "{}, I hope this day finds you well.",
+                                    self.config.domain
+                                )))?;
+                                self.state = (PollComplete::Yes, State::Accept);
+                            }
+                            Some(_) => {
+                                self.respond(Response::_503_BadSequence)?;
+                                self.state = (PollComplete::Yes, State::ReceiveGreeting);
+                            }
+                            None => {
+                                self.respond(Response::_502_CommandNotImplemented)?;
+                                self.state = (PollComplete::Yes, State::ReceiveGreeting);
+                            }
+                        },
                         _ => self.state = (PollComplete::No, State::Rejected),
                     }
                 }
 
-                (PollComplete::No, State::Accepted) => {
-                    let message = format!(
-                        "250 {}, I hope this day finds you well.",
-                        self.config.domain
-                    );
-                    self.socket.start_send(message)?;
-                    self.state = (PollComplete::Yes, State::Accept);
-                }
-
                 (PollComplete::No, State::Accept) => match try_ready!(self.socket.poll()) {
-                    Some(msg) => {
-                        if msg.starts_with("MAIL FROM:") {
-                            self.set_from(msg);
-                            self.socket.start_send("250 OK".to_string())?;
+                    // The main command loop over which the email contents are sent.
+                    Some(msg) => match Command::from_str(&msg) {
+                        Some(Command::MAIL(from)) => {
+                            self.set_from(from);
+                            self.respond(Response::_250_Completed("OK"))?;
                             self.state = (PollComplete::Yes, State::Accept);
-                        } else if msg.starts_with("RCPT TO:") {
-                            self.set_rcpt(msg);
-                            self.socket.start_send("250 OK".to_string())?;
+                        }
+                        Some(Command::RCPT(to)) => {
+                            self.set_rcpt(to);
+                            self.respond(Response::_250_Completed("OK"))?;
                             self.state = (PollComplete::Yes, State::Accept);
-                        } else if msg.starts_with("DATA") {
-                            self.socket
-                                .start_send("354 End data with <CR><LF>.<CR><LF>".to_string())?;
+                        }
+                        Some(Command::DATA) => {
+                            self.respond(Response::_354_StartMailInput)?;
                             self.state = (PollComplete::Yes, State::AcceptData);
-                        } else if msg.starts_with("QUIT") {
-                            self.socket.start_send("221 Bye".to_string())?;
+                        }
+                        Some(Command::QUIT) => {
+                            self.respond(Response::_221_ServiceClosing)?;
                             self.state = (PollComplete::Yes, State::End);
-                        } else {
+                        }
+                        _ => {
                             self.state = (PollComplete::No, State::Rejected);
                         }
-                    }
+                    },
                     _ => self.state = (PollComplete::No, State::Rejected),
                 },
 
                 (PollComplete::No, State::AcceptData) => match try_ready!(self.socket.poll()) {
+                    // In this state we are getting the main body text of the email, one line at a time.
+                    // When we get a "." by itself we are finished.
                     Some(msg) => {
                         if msg == "." {
-                            self.socket
-                                .start_send("250 Ok: queued as plork".to_string())?;
+                            self.respond(Response::_250_Completed("OK"))?;
                             self.state = (PollComplete::Yes, State::Accept);
                         } else {
                             self.set_body(msg);
@@ -195,7 +215,7 @@ mod tests {
         tokio::run(
             smtp.map(move |_| {
                 assert_eq!(
-                    "220 local ESMTP smteepee\n",
+                    "220 local ESMTP smteepee Service Ready\n",
                     String::from_utf8(receiver.recv().unwrap()).unwrap()
                 )
             })
@@ -206,12 +226,12 @@ mod tests {
     #[test]
     fn test_from() {
         let (sender, receiver) = mpsc::channel();
-        let smtp = create_socket_with("HELO\nMAIL FROM:ponk.com", sender);
+        let smtp = create_socket_with("HELO\nMAIL FROM:<onk@ponk.com >", sender);
         tokio::run(
             smtp.map(move |msg| {
                 // The initial greeting message.
                 assert_eq!(
-                    "220 local ESMTP smteepee\n",
+                    "220 local ESMTP smteepee Service Ready\n",
                     String::from_utf8(receiver.recv().unwrap()).unwrap()
                 );
                 // The accept message.
@@ -224,7 +244,7 @@ mod tests {
                     "250 OK\n",
                     String::from_utf8(receiver.recv().unwrap()).unwrap()
                 );
-                assert_eq!(Some(Some("ponk.com".to_string())), msg.map(|m| m.from));
+                assert_eq!(Some(Some("onk@ponk.com".to_string())), msg.map(|m| m.from));
             })
             .map_err(|err| eprintln!("{:?}", err)),
         );
@@ -234,13 +254,13 @@ mod tests {
     fn test_rcpt() {
         let (sender, receiver) = mpsc::channel();
         let smtp = create_socket_with(
-            "HELO\nRCPT TO:onk@ponk.com\nRCPT TO:pook@ook.co.uk\n",
+            "HELO\nRCPT TO: <onk@ponk.com>\nRCPT TO:<pook@ook.co.uk>\n",
             sender,
         );
         tokio::run(
             smtp.map(move |msg| {
                 assert_eq!(
-                    "220 local ESMTP smteepee\n",
+                    "220 local ESMTP smteepee Service Ready\n",
                     String::from_utf8(receiver.recv().unwrap()).unwrap()
                 );
                 // The accept message.
