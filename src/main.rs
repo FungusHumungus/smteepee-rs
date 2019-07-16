@@ -1,8 +1,11 @@
 use std::io;
 use std::time;
+use std::net;
+use net2::TcpBuilder;
 use tokio::codec::{Framed, LinesCodec};
 use tokio::net::tcp::TcpListener;
 use tokio::prelude::*;
+use tokio::reactor::Handle;
 
 #[macro_use]
 extern crate futures;
@@ -19,10 +22,20 @@ mod smtp;
 #[cfg(test)]
 mod dummy_socket;
 
-fn main() {
-    let addr = "127.0.0.1:2525".parse().unwrap();
-    let listener = TcpListener::bind(&addr).expect("Unable to listen");
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // let addr4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 1)), 2525);
+    /*let tcp = TcpBuilder::new_v6()?//.reuse_address(true)?
+                                   .only_v6(false)?
+                                   .bind("[::1]:2525")?
+                                   .to_tcp_listener()?;
+    let listener = TcpListener::from_std( 
+            tcp,
+            &Handle::default(),
+        ).expect("Unable to listen");
+        */
 
+    let addr6 = net::SocketAddr::new(net::IpAddr::V6(net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 2525);
+    let listener = TcpListener::bind(&addr6)?;
     let incoming = listener.incoming();
 
     let server = incoming
@@ -66,11 +79,13 @@ fn main() {
                             ))),
                         }
                     })
-                    .map(|message| println!("{:?}", message.get_data()))
+                    .map(|message| println!("{} : Email sent to {:?}", message.saved.unwrap_or("Err".to_string()), message.to))
                     .map_err(|err| eprintln!("Error {:?}", err)),
             )
         });
 
     println!("Listening on 2525");
     tokio::run(server);
+
+    Ok(())
 }
