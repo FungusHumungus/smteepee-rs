@@ -10,7 +10,7 @@ pub enum Command {
     RSET,
     NOOP,
     QUIT,
-    VRFY,
+    VRFY(String),
 }
 
 /// Build a case insensitive regex.
@@ -31,7 +31,7 @@ lazy_static! {
     static ref RSET: Regex = regex(r"RSET");
     static ref NOOP: Regex = regex(r"NOOP");
     static ref QUIT: Regex = regex(r"QUIT");
-    static ref VRFY: Regex = regex(r"VRFY");
+    static ref VRFY: Regex = regex(r"VRFY\s*:\s*<(.*)>");
 }
 
 impl Command {
@@ -63,8 +63,10 @@ impl Command {
             Some(Command::NOOP)
         } else if QUIT.is_match(text) {
             Some(Command::QUIT)
-        } else if VRFY.is_match(text) {
-            Some(Command::VRFY)
+        } else if let Some(capture) = VRFY.captures(text) {
+            // Mailbox to verify.
+            let addr = capture.get(1).unwrap().as_str();
+            Some(Command::VRFY(addr.trim().to_string()))
         } else {
             None
         }

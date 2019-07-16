@@ -138,6 +138,11 @@ where
                             self.respond(Response::_250_Completed("OK"))?;
                             self.state = (PollComplete::Yes, State::Accept);
                         }
+                        Some(Command::VRFY(addr)) => {
+                            // Currently we verify all addresses as ok..
+                            self.respond(Response::_250_Completed(&addr))?;
+                            self.state = (PollComplete::Yes, State::Accept);
+                        }
                         Some(Command::DATA) => {
                             self.respond(Response::_354_StartMailInput)?;
                             self.state = (PollComplete::Yes, State::AcceptData);
@@ -147,7 +152,8 @@ where
                             self.state = (PollComplete::Yes, State::End);
                         }
                         _ => {
-                            self.state = (PollComplete::No, State::Rejected);
+                            self.respond(Response::_503_BadSequence)?;
+                            self.state = (PollComplete::Yes, State::Rejected);
                         }
                     },
                     _ => self.state = (PollComplete::No, State::Rejected),
