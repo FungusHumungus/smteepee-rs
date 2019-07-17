@@ -1,17 +1,18 @@
 use std::io;
 use std::time;
 use std::net;
-use net2::TcpBuilder;
+use std::env;
+use std::path;
 use tokio::codec::{Framed, LinesCodec};
 use tokio::net::tcp::TcpListener;
 use tokio::prelude::*;
-use tokio::reactor::Handle;
 
 #[macro_use]
 extern crate futures;
 #[macro_use]
 extern crate lazy_static;
 
+mod settings;
 mod config;
 mod message;
 mod commands;
@@ -22,22 +23,36 @@ mod smtp;
 #[cfg(test)]
 mod dummy_socket;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // let addr4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 1)), 2525);
-    /*let tcp = TcpBuilder::new_v6()?//.reuse_address(true)?
-                                   .only_v6(false)?
-                                   .bind("[::1]:2525")?
-                                   .to_tcp_listener()?;
-    let listener = TcpListener::from_std( 
-            tcp,
-            &Handle::default(),
-        ).expect("Unable to listen");
-        */
+/// Get the address to listen to.
+fn get_listen_address(protocol: u8, port: u16) -> net::SocketAddr {
+    match protocol {
+        4 => {
+            net::SocketAddr::new(net::IpAddr::V4(net::Ipv4Addr::new(0, 0, 0, 1)), port)
+        }
+        6 => {
+            net::SocketAddr::new(net::IpAddr::V6(net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), port)
+        }
+        _ => panic!("Protocol must be either 4 or 6")
+    }
+}
 
-    let addr6 = net::SocketAddr::new(net::IpAddr::V6(net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 2525);
-    let listener = TcpListener::bind(&addr6)?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+   
+    // Load the settings from the file specified in the first argument.
+    let args: Vec<_> = env::args().collect();
+    let settings = if args.len() > 1 {
+        let path = args[1].clone();
+        settings::Settings::load(path::Path::new(&path))?
+    } else {
+        settings::Settings::default()
+    };
+
+    // Setup the socket.
+    let addr = get_listen_address(settings.protocol, settings.port);
+    let listener = TcpListener::bind(&addr)?;
     let incoming = listener.incoming();
 
+    // Run up the server.
     let server = incoming
         .map_err(|e| eprintln!("Accept failed = {:?}", e))
         .for_each(|socket| {
@@ -84,7 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         });
 
-    println!("Listening on 2525");
+    println!("Listening on {}", settings.port);
     tokio::run(server);
 
     Ok(())
