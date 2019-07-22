@@ -6,6 +6,7 @@ pub enum Command {
     HELO(String),
     MAIL(String),
     RCPT(String),
+    AUTH(String),   // TODO Auth method really should be a string.
     DATA,
     RSET,
     NOOP,
@@ -25,6 +26,7 @@ fn regex(re: &str) -> Regex {
 lazy_static! {
     static ref EHLO: Regex = regex(r"EHLO");
     static ref HELO: Regex = regex(r"HELO");
+    static ref AUTH: Regex = regex(r"AUTH\s*(.*)\s*");
     static ref MAIL: Regex = regex(r"MAIL FROM\s*:\s*<(.*)>");
     static ref RCPT: Regex = regex(r"RCPT TO\s*:\s*<(.*)>");
     static ref DATA: Regex = regex(r"DATA");
@@ -55,6 +57,9 @@ impl Command {
             // names MUST NOT be copied into the reverse-path. 
             let to = capture.get(1).unwrap().as_str();
             Some(Command::RCPT(to.trim().to_string()))
+        } else if let Some(capture) = AUTH.captures(text) {
+            let method = capture.get(1).unwrap().as_str();
+            Some(Command::AUTH(method.trim().to_string()))  
         } else if DATA.is_match(text) {
             Some(Command::DATA)
         } else if RSET.is_match(text) {

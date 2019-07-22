@@ -27,7 +27,7 @@ mod dummy_socket;
 fn get_listen_address(protocol: u8, port: u16) -> net::SocketAddr {
     match protocol {
         4 => {
-            net::SocketAddr::new(net::IpAddr::V4(net::Ipv4Addr::new(0, 0, 0, 1)), port)
+            net::SocketAddr::new(net::IpAddr::V4(net::Ipv4Addr::new(0, 0, 0, 0)), port)
         }
         6 => {
             net::SocketAddr::new(net::IpAddr::V6(net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), port)

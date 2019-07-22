@@ -7,15 +7,23 @@ use tokio::codec::{Framed, LinesCodec};
 use tokio::prelude::*;
 
 #[derive(Clone, Copy)]
+pub enum Authentication {
+    ReceiveAuthCommand,
+    ReceivePlainAuth,
+}
+
+#[derive(Clone, Copy)]
 pub enum State {
     SendGreeting,
     ReceiveGreeting,
+    Authenticate(Authentication),
     Rejected,
     Accept,
     AcceptData,
     End,
 }
 
+#[derive(Clone)]
 pub enum PollComplete {
     Yes,
     No,
@@ -30,7 +38,10 @@ pub struct Smtp<T> {
     pub message: Option<Message>,
 }
 
-impl<T> Smtp<T> {
+impl<T> Smtp<T>
+where
+    T: AsyncRead + AsyncWrite,
+{
     pub fn new(config: Config, socket: Framed<T, LinesCodec>) -> Self {
         Smtp {
             config,
@@ -80,6 +91,41 @@ impl<T> Smtp<T> {
     {
         self.socket.start_send(response.as_string())
     }
+
+    fn authentication_poll(&mut self, stage: &Authentication) -> Poll<(), io::Error> {
+        match try_ready!(self.socket.poll()) {
+            Some(ref msg) => match stage {
+                Authentication::ReceiveAuthCommand => match Command::from_str(msg) {
+                    Some(Command::AUTH(_)) => {
+                        self.respond(Response::_334_Authenticate)?;
+                        self.state = (
+                            PollComplete::Yes,
+                            State::Authenticate(Authentication::ReceivePlainAuth),
+                        );
+                    }
+                    _ => {
+                        self.respond(Response::_503_BadSequence)?;
+                        self.state = (
+                            PollComplete::Yes,
+                            State::Authenticate(Authentication::ReceiveAuthCommand),
+                        );
+                    }
+                },
+
+                Authentication::ReceivePlainAuth => {
+                    // TODO Dont assume the authentication is correct.
+                    self.respond(Response::_235_AuthenticationSuccessful)?;
+                    self.state = (PollComplete::Yes, State::Accept);
+                }
+            },
+            None => {
+                self.respond(Response::_502_CommandNotImplemented)?;
+                self.state = (PollComplete::Yes, State::Authenticate(stage.clone()));
+            }
+        }
+
+        Ok(Async::Ready(()))
+    }
 }
 
 impl<T> Future for Smtp<T>
@@ -93,7 +139,7 @@ where
     /// occur whilst receiving an SMTP message.
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         loop {
-            match &self.state {
+            match &self.state.clone() {
                 (PollComplete::No, State::SendGreeting) => {
                     // Send the initial greeting.
                     self.respond(Response::_220_ServiceReady("smteepee"))?;
@@ -105,12 +151,23 @@ where
                     // Then if it is correct we can get on with the main command loop.
                     match try_ready!(self.socket.poll()) {
                         Some(ref msg) => match Command::from_str(msg) {
-                            Some(Command::HELO(_)) | Some(Command::EHLO(_)) => {
+                            Some(Command::HELO(_)) => {
                                 self.respond(Response::_250_Completed(&format!(
                                     "{}, I hope this day finds you well.",
                                     self.config.domain
                                 )))?;
                                 self.state = (PollComplete::Yes, State::Accept);
+                            }
+                            Some(Command::EHLO(_)) => {
+                                self.respond(Response::_250_Completed(&format!(
+                                    "{}, I hope this day finds you well.",
+                                    self.config.domain
+                                )))?;
+                                self.respond(Response::_250_Completed("AUTH PLAIN"))?;
+                                self.state = (
+                                    PollComplete::Yes,
+                                    State::Authenticate(Authentication::ReceiveAuthCommand),
+                                );
                             }
                             Some(_) => {
                                 self.respond(Response::_503_BadSequence)?;
@@ -123,6 +180,10 @@ where
                         },
                         _ => self.state = (PollComplete::No, State::Rejected),
                     }
+                }
+
+                (PollComplete::No, State::Authenticate(stage)) => {
+                    try_ready!(self.authentication_poll(stage))
                 }
 
                 (PollComplete::No, State::Accept) => match try_ready!(self.socket.poll()) {

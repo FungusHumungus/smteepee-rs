@@ -4,9 +4,11 @@ pub enum Response<'a> {
     _214_Help,
     _220_ServiceReady(&'a str),
     _221_ServiceClosing,
+    _235_AuthenticationSuccessful,
     _250_Completed(&'a str),
     _251_UserNotLocal,
     _252_CannotVRFYuser, // but will accept message and attempt delivery
+    _334_Authenticate,
     _354_StartMailInput, // end with <CRLF>.<CRLF>
     _421_ServiceNotAvailable(&'a str),
     _450_MailboxUnavailable,
@@ -35,9 +37,11 @@ impl<'a> Response<'a> {
                 format!("220 local ESMTP {} Service Ready", domain)
             }
             Response::_221_ServiceClosing => "221 Bye".to_string(),
+            Response::_235_AuthenticationSuccessful => "235 Authentication successful".to_string(),
             Response::_250_Completed(greeting) => format!("250 {}", greeting),
             Response::_251_UserNotLocal => "251".to_string(),
             Response::_252_CannotVRFYuser => "252".to_string(),
+            Response::_334_Authenticate => "334 ".to_string(),
             Response::_354_StartMailInput => "354 End data with <CR><LF>.<CR><LF>".to_string(),
             Response::_421_ServiceNotAvailable(_domain) => "421".to_string(),
             Response::_450_MailboxUnavailable => "450".to_string(),
