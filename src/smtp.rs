@@ -1,5 +1,5 @@
 use crate::commands::Command;
-use crate::config::Config;
+use crate::settings::Settings;
 use crate::message::Message;
 use crate::responses::Response;
 use std::io;
@@ -32,7 +32,7 @@ pub enum PollComplete {
 /// A struct that implements Future that is responsible for the dialog
 /// between client and server to receive an SMTP message.
 pub struct Smtp<T> {
-    pub config: Config,
+    pub settings: Settings,
     pub socket: Framed<T, LinesCodec>,
     pub state: (PollComplete, State),
     pub message: Option<Message>,
@@ -42,9 +42,9 @@ impl<T> Smtp<T>
 where
     T: AsyncRead + AsyncWrite,
 {
-    pub fn new(config: Config, socket: Framed<T, LinesCodec>) -> Self {
+    pub fn new(settings: Settings, socket: Framed<T, LinesCodec>) -> Self {
         Smtp {
-            config,
+            settings,
             socket,
             state: (PollComplete::No, State::SendGreeting),
             message: None,
@@ -154,14 +154,14 @@ where
                             Some(Command::HELO(_)) => {
                                 self.respond(Response::_250_Completed(&format!(
                                     "{}, I hope this day finds you well.",
-                                    self.config.domain
+                                    self.settings.domain
                                 )))?;
                                 self.state = (PollComplete::Yes, State::Accept);
                             }
                             Some(Command::EHLO(_)) => {
                                 self.respond(Response::_250_Completed(&format!(
                                     "{}, I hope this day finds you well.",
-                                    self.config.domain
+                                    self.settings.domain
                                 )))?;
                                 self.respond(Response::_250_Completed("AUTH PLAIN"))?;
                                 self.state = (
@@ -255,7 +255,7 @@ where
 #[cfg(test)]
 mod tests {
 
-    use crate::config::Config;
+    use crate::settings::Settings;
     use crate::dummy_socket::DummySocket;
     use crate::smtp::Smtp;
     use std::sync::mpsc;
@@ -268,9 +268,7 @@ mod tests {
         let socket = DummySocket::new_with_channel(data.into(), sender);
         let framed = Framed::new(socket, LinesCodec::new());
         Smtp::new(
-            Config {
-                domain: "groove.com".to_string(),
-            },
+            Settings::default(),
             framed,
         )
     }

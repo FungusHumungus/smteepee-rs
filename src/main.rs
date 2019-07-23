@@ -1,8 +1,8 @@
-use std::io;
-use std::time;
-use std::net;
 use std::env;
+use std::io;
+use std::net;
 use std::path;
+use std::time;
 use tokio::codec::{Framed, LinesCodec};
 use tokio::net::tcp::TcpListener;
 use tokio::prelude::*;
@@ -12,13 +12,12 @@ extern crate futures;
 #[macro_use]
 extern crate lazy_static;
 
-mod settings;
+mod commands;
 mod config;
 mod message;
-mod commands;
 mod responses;
+mod settings;
 mod smtp;
-
 
 #[cfg(test)]
 mod dummy_socket;
@@ -26,28 +25,30 @@ mod dummy_socket;
 /// Get the address to listen to.
 fn get_listen_address(protocol: u8, port: u16) -> net::SocketAddr {
     match protocol {
-        4 => {
-            net::SocketAddr::new(net::IpAddr::V4(net::Ipv4Addr::new(0, 0, 0, 0)), port)
-        }
-        6 => {
-            net::SocketAddr::new(net::IpAddr::V6(net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), port)
-        }
-        _ => panic!("Protocol must be either 4 or 6")
+        4 => net::SocketAddr::new(net::IpAddr::V4(net::Ipv4Addr::new(0, 0, 0, 0)), port),
+        6 => net::SocketAddr::new(
+            net::IpAddr::V6(net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
+            port,
+        ),
+        _ => panic!("Protocol must be either 4 or 6"),
+    }
+}
+
+/// Load the settings from the file specified in the first argument.
+fn load_settings() -> Result<settings::Settings, Box<dyn std::error::Error>> {
+    let args: Vec<_> = env::args().collect();
+    if args.len() > 1 {
+        let path = args[1].clone();
+        settings::Settings::load(path::Path::new(&path))
+    } else {
+        Ok(settings::Settings::default())
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-   
-    // Load the settings from the file specified in the first argument.
-    let args: Vec<_> = env::args().collect();
-    let settings = if args.len() > 1 {
-        let path = args[1].clone();
-        settings::Settings::load(path::Path::new(&path))?
-    } else {
-        settings::Settings::default()
-    };
 
     // Setup the socket.
+    let settings = load_settings()?;
     let addr = get_listen_address(settings.protocol, settings.port);
     let listener = TcpListener::bind(&addr)?;
     let incoming = listener.incoming();
@@ -56,17 +57,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = incoming
         .map_err(|e| eprintln!("Accept failed = {:?}", e))
         .for_each(|socket| {
-            
             // TODO : SMTP line endings are CRLF.
             // We are going to need to create our own Codec that can handle this specifically.
             let framed = Framed::new(socket, LinesCodec::new());
 
-            let handle = smtp::Smtp::new(
-                config::Config {
-                    domain: "groove.com".to_string(),
-                },
-                framed,
-            );
+            let handle = smtp::Smtp::new(settings, framed);
 
             tokio::spawn(
                 handle
@@ -94,7 +89,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ))),
                         }
                     })
-                    .map(|message| println!("{} : Email sent to {:?}", message.saved.unwrap_or("Err".to_string()), message.to))
+                    .map(|message| {
+                        println!(
+                            "{} : Email sent to {:?}",
+                            message.saved.unwrap_or("Err".to_string()),
+                            message.to
+                        )
+                    })
                     .map_err(|err| eprintln!("Error {:?}", err)),
             )
         });

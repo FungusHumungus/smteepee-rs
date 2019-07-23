@@ -13,11 +13,14 @@ pub enum Protocol {
     V6,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct Settings {
     pub port: u16,
     pub protocol: u8,
+    pub domain: String,
+    pub password: String,
 }
+
 
 impl Settings {
     
@@ -40,7 +43,9 @@ impl Settings {
     pub fn default() -> Self {
         Settings {
             port: 25,
-            protocol: 4
+            protocol: 4,
+            domain: String::from("groove.com"),
+            password: String::from("password"),
         }
     }
 }
