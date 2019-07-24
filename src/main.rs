@@ -1,8 +1,4 @@
-use std::env;
-use std::io;
-use std::net;
-use std::path;
-use std::time;
+use std::{env, io, net, path, time};
 use tokio::codec::{Framed, LinesCodec};
 use tokio::net::tcp::TcpListener;
 use tokio::prelude::*;
@@ -13,7 +9,6 @@ extern crate futures;
 extern crate lazy_static;
 
 mod commands;
-mod config;
 mod message;
 mod responses;
 mod settings;
@@ -45,11 +40,15 @@ fn load_settings() -> Result<settings::Settings, Box<dyn std::error::Error>> {
     }
 }
 
+lazy_static! {
+    static ref SETTINGS:settings::Settings = load_settings().unwrap();
+}
+
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Setup the socket.
-    let settings = load_settings()?;
-    let addr = get_listen_address(settings.protocol, settings.port);
+    let addr = get_listen_address(SETTINGS.protocol, SETTINGS.port);
     let listener = TcpListener::bind(&addr)?;
     let incoming = listener.incoming();
 
@@ -61,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // We are going to need to create our own Codec that can handle this specifically.
             let framed = Framed::new(socket, LinesCodec::new());
 
-            let handle = smtp::Smtp::new(settings, framed);
+            let handle = smtp::Smtp::new(&SETTINGS, framed);
 
             tokio::spawn(
                 handle
@@ -100,7 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         });
 
-    println!("Listening on {}", settings.port);
+    println!("Listening on {}", SETTINGS.port);
     tokio::run(server);
 
     Ok(())

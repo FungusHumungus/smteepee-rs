@@ -31,18 +31,18 @@ pub enum PollComplete {
 
 /// A struct that implements Future that is responsible for the dialog
 /// between client and server to receive an SMTP message.
-pub struct Smtp<T> {
-    pub settings: Settings,
+pub struct Smtp<'a, T> {
+    pub settings: &'a Settings,
     pub socket: Framed<T, LinesCodec>,
     pub state: (PollComplete, State),
     pub message: Option<Message>,
 }
 
-impl<T> Smtp<T>
+impl<'a, T> Smtp<'a, T>
 where
     T: AsyncRead + AsyncWrite,
 {
-    pub fn new(settings: Settings, socket: Framed<T, LinesCodec>) -> Self {
+    pub fn new(settings: &'a Settings, socket: Framed<T, LinesCodec>) -> Self {
         Smtp {
             settings,
             socket,
@@ -128,7 +128,7 @@ where
     }
 }
 
-impl<T> Future for Smtp<T>
+impl<'a, T> Future for Smtp<'a, T>
 where
     T: AsyncRead + AsyncWrite,
 {
