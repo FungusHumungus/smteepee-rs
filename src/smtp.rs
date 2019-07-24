@@ -1,7 +1,8 @@
 use crate::commands::Command;
-use crate::settings::Settings;
 use crate::message::Message;
 use crate::responses::Response;
+use crate::settings::Settings;
+use base64;
 use std::io;
 use tokio::codec::{Framed, LinesCodec};
 use tokio::prelude::*;
@@ -113,9 +114,16 @@ where
                 },
 
                 Authentication::ReceivePlainAuth => {
-                    // TODO Dont assume the authentication is correct.
-                    self.respond(Response::_235_AuthenticationSuccessful)?;
-                    self.state = (PollComplete::Yes, State::Accept);
+                    if &base64::encode(&self.settings.password) == msg {
+                        self.respond(Response::_235_AuthenticationSuccessful)?;
+                        self.state = (PollComplete::Yes, State::Accept);
+                    } else {
+                        self.respond(Response::_535_FailedAuthentication)?;
+                        self.state = (
+                            PollComplete::Yes,
+                            State::Authenticate(Authentication::ReceiveAuthCommand),
+                        );
+                    }
                 }
             },
             None => {
@@ -255,8 +263,8 @@ where
 #[cfg(test)]
 mod tests {
 
-    use crate::settings::Settings;
     use crate::dummy_socket::DummySocket;
+    use crate::settings::Settings;
     use crate::smtp::Smtp;
     use std::sync::mpsc;
     use tokio::codec::{Framed, LinesCodec};
@@ -267,10 +275,7 @@ mod tests {
     fn create_socket_with(data: &str, sender: mpsc::Sender<Vec<u8>>) -> Smtp<DummySocket> {
         let socket = DummySocket::new_with_channel(data.into(), sender);
         let framed = Framed::new(socket, LinesCodec::new());
-        Smtp::new(
-            Settings::default(),
-            framed,
-        )
+        Smtp::new(Settings::default(), framed)
     }
 
     #[test]

@@ -20,6 +20,7 @@ pub enum Response<'a> {
     _502_CommandNotImplemented,
     _503_BadSequence,
     _504_ParameterNotImplemented,
+    _535_FailedAuthentication,
     _550_MailboxUnavailable,
     _551_UserNotLocal, // please try <forward-path> (See Section 3.4)
     _552_ExceededStorageAllocation,
@@ -53,6 +54,7 @@ impl<'a> Response<'a> {
             Response::_502_CommandNotImplemented => "502".to_string(),
             Response::_503_BadSequence => "503".to_string(),
             Response::_504_ParameterNotImplemented => "504".to_string(),
+            Response::_535_FailedAuthentication => "535 Failed Authentication".to_string(),
             Response::_550_MailboxUnavailable => "550".to_string(),
             Response::_551_UserNotLocal => "551".to_string(),
             Response::_552_ExceededStorageAllocation => "552".to_string(),
