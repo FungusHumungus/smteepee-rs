@@ -42,7 +42,7 @@ impl Settings {
     /// Return a default set of settings for when no input file is given.
     pub fn default() -> Self {
         Settings {
-            port: 25,
+            port: 2525,
             protocol: 4,
             domain: String::from("groove.com"),
             password: String::from("password"),

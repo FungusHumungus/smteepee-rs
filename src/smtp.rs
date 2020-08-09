@@ -3,9 +3,11 @@ use crate::message::Message;
 use crate::responses::Response;
 use crate::settings::Settings;
 use base64;
-use std::io;
-use tokio::codec::{Framed, LinesCodec};
+use futures::sink::*;
+use std::error;
 use tokio::prelude::*;
+use tokio::stream::StreamExt;
+use tokio_util::codec::{Framed, LinesCodec};
 
 #[derive(Clone, Copy)]
 pub enum Authentication {
@@ -17,244 +19,174 @@ pub enum Authentication {
 pub enum State {
     SendGreeting,
     ReceiveGreeting,
-    Authenticate(Authentication),
     Rejected,
     Accept,
     AcceptData,
     End,
 }
 
-#[derive(Clone)]
-pub enum PollComplete {
-    Yes,
-    No,
-}
-
-/// A struct that implements Future that is responsible for the dialog
-/// between client and server to receive an SMTP message.
-pub struct Smtp<'a, T> {
-    pub settings: &'a Settings,
-    pub socket: Framed<T, LinesCodec>,
-    pub state: (PollComplete, State),
-    pub message: Option<Message>,
-}
-
-impl<'a, T> Smtp<'a, T>
+async fn respond<'a, T>(
+    stream: &mut Framed<T, LinesCodec>,
+    response: Response<'a>,
+) -> Result<(), Box<dyn error::Error>>
 where
-    T: AsyncRead + AsyncWrite,
+    T: AsyncRead + AsyncWrite + Unpin,
 {
-    pub fn new(settings: &'a Settings, socket: Framed<T, LinesCodec>) -> Self {
-        Smtp {
-            settings,
-            socket,
-            state: (PollComplete::No, State::SendGreeting),
-            message: None,
-        }
-    }
+    stream.send(response.as_string()).await?;
+    Ok(())
+}
 
-    /// Creates a message if there isn't one.
-    fn set_message(&mut self) {
-        if self.message.is_none() {
-            self.message = Some(Message::new());
-        }
-    }
+async fn authentication<T>(
+    mut stream: &mut Framed<T, LinesCodec>,
+    settings: &Settings,
+) -> Result<bool, Box<dyn error::Error>>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut stage = Authentication::ReceiveAuthCommand;
 
-    fn set_from(&mut self, from: String) {
-        self.set_message();
-
-        match self.message.as_mut() {
-            Some(m) => m.from = Some(from),
-            None => {}
-        }
-    }
-
-    fn set_rcpt(&mut self, to: String) {
-        self.set_message();
-
-        match self.message.as_mut() {
-            Some(m) => m.to.push(to),
-            None => {}
-        }
-    }
-
-    fn set_body(&mut self, data: String) {
-        self.set_message();
-
-        match self.message.as_mut() {
-            Some(m) => m.data.push(data),
-            None => {}
-        }
-    }
-
-    fn respond(&mut self, response: Response) -> Result<AsyncSink<String>, io::Error>
-    where
-        T: AsyncRead + AsyncWrite,
-    {
-        self.socket.start_send(response.as_string())
-    }
-
-    fn authentication_poll(&mut self, stage: &Authentication) -> Poll<(), io::Error> {
-        match try_ready!(self.socket.poll()) {
-            Some(ref msg) => match stage {
-                Authentication::ReceiveAuthCommand => match Command::from_str(msg) {
+    loop {
+        if let Some(line) = stream.next().await {
+            match stage {
+                Authentication::ReceiveAuthCommand => match Command::from_str(&line?) {
                     Some(Command::AUTH(_)) => {
-                        self.respond(Response::_334_Authenticate)?;
-                        self.state = (
-                            PollComplete::Yes,
-                            State::Authenticate(Authentication::ReceivePlainAuth),
-                        );
+                        respond(&mut stream, Response::_334_Authenticate).await?;
+                        stage = Authentication::ReceivePlainAuth;
                     }
                     _ => {
-                        self.respond(Response::_503_BadSequence)?;
-                        self.state = (
-                            PollComplete::Yes,
-                            State::Authenticate(Authentication::ReceiveAuthCommand),
-                        );
+                        respond(&mut stream, Response::_503_BadSequence).await?;
+                        stage = Authentication::ReceiveAuthCommand;
                     }
                 },
 
                 Authentication::ReceivePlainAuth => {
-                    if &base64::encode(&self.settings.password) == msg {
-                        self.respond(Response::_235_AuthenticationSuccessful)?;
-                        self.state = (PollComplete::Yes, State::Accept);
+                    if base64::encode(&settings.password) == line? {
+                        respond(&mut stream, Response::_235_AuthenticationSuccessful).await?;
+                        return Ok(true);
                     } else {
-                        self.respond(Response::_535_FailedAuthentication)?;
-                        self.state = (
-                            PollComplete::Yes,
-                            State::Authenticate(Authentication::ReceiveAuthCommand),
-                        );
+                        respond(&mut stream, Response::_535_FailedAuthentication).await?;
+                        stage = Authentication::ReceiveAuthCommand;
                     }
                 }
-            },
-            None => {
-                self.respond(Response::_502_CommandNotImplemented)?;
-                self.state = (PollComplete::Yes, State::Authenticate(stage.clone()));
             }
         }
-
-        Ok(Async::Ready(()))
     }
 }
 
-impl<'a, T> Future for Smtp<'a, T>
-where
-    T: AsyncRead + AsyncWrite,
-{
-    type Item = Option<Message>;
-    type Error = io::Error;
+pub async fn converse<T: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: Framed<T, LinesCodec>,
+    settings: &Settings,
+) -> Result<Message, Box<dyn error::Error>> {
+    let mut message = Message::new();
+    let mut state = State::SendGreeting;
 
-    /// poll implements a state machine that handles the various states that
-    /// occur whilst receiving an SMTP message.
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        loop {
-            match &self.state.clone() {
-                (PollComplete::No, State::SendGreeting) => {
-                    // Send the initial greeting.
-                    self.respond(Response::_220_ServiceReady("smteepee"))?;
-                    self.state = (PollComplete::Yes, State::ReceiveGreeting);
-                }
+    loop {
+        match state {
+            State::SendGreeting => {
+                // Send the initial greeting.
+                respond(&mut stream, Response::_220_ServiceReady("smteepee")).await?;
+                state = State::ReceiveGreeting;
+            }
 
-                (PollComplete::No, State::ReceiveGreeting) => {
+            State::ReceiveGreeting => {
+                if let Some(line) = stream.next().await {
                     // The first command we must recieve must be an EHLO or a HELO command.
                     // Then if it is correct we can get on with the main command loop.
-                    match try_ready!(self.socket.poll()) {
-                        Some(ref msg) => match Command::from_str(msg) {
-                            Some(Command::HELO(_)) => {
-                                self.respond(Response::_250_Completed(&format!(
+                    match Command::from_str(&line?) {
+                        Some(Command::HELO(_)) => {
+                            respond(
+                                &mut stream,
+                                Response::_250_Completed(&format!(
                                     "{}, I hope this day finds you well.",
-                                    self.settings.domain
-                                )))?;
-                                self.state = (PollComplete::Yes, State::Accept);
-                            }
-                            Some(Command::EHLO(_)) => {
-                                self.respond(Response::_250_Completed(&format!(
+                                    settings.domain
+                                )),
+                            )
+                            .await?;
+                            state = State::Accept;
+                        }
+                        Some(Command::EHLO(_)) => {
+                            respond(
+                                &mut stream,
+                                Response::_250_Completed(&format!(
                                     "{}, I hope this day finds you well.",
-                                    self.settings.domain
-                                )))?;
-                                self.respond(Response::_250_Completed("AUTH PLAIN"))?;
-                                self.state = (
-                                    PollComplete::Yes,
-                                    State::Authenticate(Authentication::ReceiveAuthCommand),
-                                );
+                                    settings.domain
+                                )),
+                            )
+                            .await?;
+                            respond(&mut stream, Response::_250_Completed("AUTH PLAIN")).await?;
+
+                            // Authentication must pass before we can get beyond this stage.
+                            if authentication(&mut stream, settings).await? == true {
+                                state = State::Accept;
+                            } else {
+                                state = State::End;
                             }
-                            Some(_) => {
-                                self.respond(Response::_503_BadSequence)?;
-                                self.state = (PollComplete::Yes, State::ReceiveGreeting);
-                            }
-                            None => {
-                                self.respond(Response::_502_CommandNotImplemented)?;
-                                self.state = (PollComplete::Yes, State::ReceiveGreeting);
-                            }
-                        },
-                        _ => self.state = (PollComplete::No, State::Rejected),
+                        }
+                        Some(_) => {
+                            respond(&mut stream, Response::_503_BadSequence).await?;
+                            state = State::ReceiveGreeting;
+                        }
+                        None => {
+                            respond(&mut stream, Response::_502_CommandNotImplemented).await?;
+                            state = State::ReceiveGreeting;
+                        }
                     }
                 }
+            }
 
-                (PollComplete::No, State::Authenticate(stage)) => {
-                    try_ready!(self.authentication_poll(stage))
-                }
-
-                (PollComplete::No, State::Accept) => match try_ready!(self.socket.poll()) {
+            State::Accept => {
+                if let Some(line) = stream.next().await {
                     // The main command loop over which the email contents are sent.
-                    Some(msg) => match Command::from_str(&msg) {
+                    match Command::from_str(&line?) {
                         Some(Command::MAIL(from)) => {
-                            self.set_from(from);
-                            self.respond(Response::_250_Completed("OK"))?;
-                            self.state = (PollComplete::Yes, State::Accept);
+                            message.from = Some(from);
+                            respond(&mut stream, Response::_250_Completed("OK")).await?;
                         }
                         Some(Command::RCPT(to)) => {
-                            self.set_rcpt(to);
-                            self.respond(Response::_250_Completed("OK"))?;
-                            self.state = (PollComplete::Yes, State::Accept);
+                            message.to.push(to);
+                            respond(&mut stream, Response::_250_Completed("OK")).await?;
                         }
                         Some(Command::VRFY(addr)) => {
                             // Currently we verify all addresses as ok..
-                            self.respond(Response::_250_Completed(&addr))?;
-                            self.state = (PollComplete::Yes, State::Accept);
+                            respond(&mut stream, Response::_250_Completed(&addr)).await?;
                         }
                         Some(Command::DATA) => {
-                            self.respond(Response::_354_StartMailInput)?;
-                            self.state = (PollComplete::Yes, State::AcceptData);
+                            respond(&mut stream, Response::_354_StartMailInput).await?;
+                            state = State::AcceptData;
                         }
                         Some(Command::QUIT) => {
-                            self.respond(Response::_221_ServiceClosing)?;
-                            self.state = (PollComplete::Yes, State::End);
+                            respond(&mut stream, Response::_221_ServiceClosing).await?;
+                            state = State::End;
                         }
                         _ => {
-                            self.respond(Response::_503_BadSequence)?;
-                            self.state = (PollComplete::Yes, State::Rejected);
-                        }
-                    },
-                    _ => self.state = (PollComplete::No, State::Rejected),
-                },
-
-                (PollComplete::No, State::AcceptData) => match try_ready!(self.socket.poll()) {
-                    // In this state we are getting the main body text of the email, one line at a time.
-                    // When we get a "." by itself we are finished.
-                    Some(msg) => {
-                        if msg == "." {
-                            self.respond(Response::_250_Completed("OK"))?;
-                            self.state = (PollComplete::Yes, State::Accept);
-                        } else {
-                            self.set_body(msg);
+                            respond(&mut stream, Response::_503_BadSequence).await?;
+                            state = State::Rejected;
                         }
                     }
-                    _ => {}
-                },
-
-                (PollComplete::No, State::Rejected) => {
-                    self.socket.start_send("Error".to_string())?;
-                    self.state = (PollComplete::Yes, State::End);
                 }
+            }
 
-                (PollComplete::No, State::End) => {
-                    return Ok(Async::Ready(self.message.take()));
+            State::AcceptData => {
+                // In this state we are getting the main body text of the email, one line at a time.
+                // When we get a "." by itself we are finished.
+                if let Some(msg) = stream.next().await {
+                    let msg = msg?;
+                    if msg == "." {
+                        respond(&mut stream, Response::_250_Completed("OK")).await?;
+                        state = State::Accept;
+                    } else {
+                        message.data.push(msg);
+                    }
                 }
+            }
 
-                (PollComplete::Yes, state) => {
-                    try_ready!(self.socket.poll_complete());
-                    self.state = (PollComplete::No, state.clone());
-                }
+            State::Rejected => {
+                stream.send("Error".to_string()).await?;
+                state = State::End;
+            }
+
+            State::End => {
+                return Ok(message);
             }
         }
     }
@@ -263,102 +195,60 @@ where
 #[cfg(test)]
 mod tests {
 
-    use crate::dummy_socket::DummySocket;
     use crate::settings::Settings;
-    use crate::smtp::Smtp;
-    use std::sync::mpsc;
-    use tokio::codec::{Framed, LinesCodec};
-    use tokio::prelude::*;
-
-    /// Convenience function to create the Smtp future that receives
-    /// the given data from the socket.
-    fn create_socket_with(data: &str, sender: mpsc::Sender<Vec<u8>>) -> Smtp<DummySocket> {
-        let socket = DummySocket::new_with_channel(data.into(), sender);
-        let framed = Framed::new(socket, LinesCodec::new());
-        Smtp::new(Settings::default(), framed)
-    }
+    use crate::smtp::converse;
+    use tokio_test::{block_on, io};
+    use tokio_util::codec::{Framed, LinesCodec};
 
     #[test]
     fn test_greeting() {
-        let (sender, receiver) = mpsc::channel();
-        let smtp = create_socket_with("HELO\n", sender);
-        tokio::run(
-            smtp.map(move |_| {
-                assert_eq!(
-                    "220 local ESMTP smteepee Service Ready\n",
-                    String::from_utf8(receiver.recv().unwrap()).unwrap()
-                )
-            })
-            .map_err(|err| eprintln!("{:?}", err)),
-        );
+        let stream = io::Builder::new()
+            .write(b"220 local ESMTP smteepee Service Ready\n")
+            .read(b"HELO\n")
+            .write(b"250 groove.com, I hope this day finds you well.\n")
+            .read(b"QUIT\n")
+            .write(b"221 Bye\n")
+            .build();
+        let framed = Framed::new(stream, LinesCodec::new());
+        let _message = block_on(converse(framed, &Settings::default()));
     }
 
     #[test]
     fn test_from() {
-        let (sender, receiver) = mpsc::channel();
-        let smtp = create_socket_with("HELO\nMAIL FROM:<onk@ponk.com >", sender);
-        tokio::run(
-            smtp.map(move |msg| {
-                // The initial greeting message.
-                assert_eq!(
-                    "220 local ESMTP smteepee Service Ready\n",
-                    String::from_utf8(receiver.recv().unwrap()).unwrap()
-                );
-                // The accept message.
-                assert_eq!(
-                    "250 groove.com, I hope this day finds you well.\n",
-                    String::from_utf8(receiver.recv().unwrap()).unwrap()
-                );
-                // 250 OK is returned when we send a from.
-                assert_eq!(
-                    "250 OK\n",
-                    String::from_utf8(receiver.recv().unwrap()).unwrap()
-                );
-                assert_eq!(Some(Some("onk@ponk.com".to_string())), msg.map(|m| m.from));
-            })
-            .map_err(|err| eprintln!("{:?}", err)),
-        );
+        let stream = io::Builder::new()
+            .write(b"220 local ESMTP smteepee Service Ready\n")
+            .read(b"HELO\n")
+            .write(b"250 groove.com, I hope this day finds you well.\n")
+            .read(b"MAIL FROM:<onk@ponk.com>\n")
+            .write(b"250 OK\n")
+            .read(b"QUIT\n")
+            .write(b"221 Bye\n")
+            .build();
+        let framed = Framed::new(stream, LinesCodec::new());
+        let message = block_on(converse(framed, &Settings::default()));
+
+        assert_eq!(Some("onk@ponk.com".to_string()), message.unwrap().from);
     }
 
     #[test]
     fn test_rcpt() {
-        let (sender, receiver) = mpsc::channel();
-        let smtp = create_socket_with(
-            "HELO\nRCPT TO: <onk@ponk.com>\nRCPT TO:<pook@ook.co.uk>\n",
-            sender,
-        );
-        tokio::run(
-            smtp.map(move |msg| {
-                assert_eq!(
-                    "220 local ESMTP smteepee Service Ready\n",
-                    String::from_utf8(receiver.recv().unwrap()).unwrap()
-                );
-                // The accept message.
-                assert_eq!(
-                    "250 groove.com, I hope this day finds you well.\n",
-                    String::from_utf8(receiver.recv().unwrap()).unwrap()
-                );
-                // 250 OK is returned when we send a recipient.
-                // We get two of them as there are two recipients.
-                assert_eq!(
-                    "250 OK\n",
-                    String::from_utf8(receiver.recv().unwrap()).unwrap()
-                );
-                assert_eq!(
-                    "250 OK\n",
-                    String::from_utf8(receiver.recv().unwrap()).unwrap()
-                );
+        let stream = io::Builder::new()
+            .write(b"220 local ESMTP smteepee Service Ready\n")
+            .read(b"HELO\n")
+            .write(b"250 groove.com, I hope this day finds you well.\n")
+            .read(b"RCPT TO: <onk@ponk.com>\n")
+            .write(b"250 OK\n")
+            .read(b"RCPT TO:<pook@ook.co.uk>\n")
+            .write(b"250 OK\n")
+            .read(b"QUIT\n")
+            .write(b"221 Bye\n")
+            .build();
+        let framed = Framed::new(stream, LinesCodec::new());
+        let message = block_on(converse(framed, &Settings::default()));
 
-                assert_eq!(
-                    Some(vec![
-                        "onk@ponk.com".to_string(),
-                        "pook@ook.co.uk".to_string(),
-                    ]),
-                    msg.map(|m| m.to)
-                );
-            })
-            .map_err(|err| eprintln!("{:?}", err)),
+        assert_eq!(
+            vec!["onk@ponk.com".to_string(), "pook@ook.co.uk".to_string()],
+            message.unwrap().to
         );
     }
-
 }

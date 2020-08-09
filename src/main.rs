@@ -1,10 +1,7 @@
-use std::{env, io, net, path, time};
-use tokio::codec::{Framed, LinesCodec};
-use tokio::net::tcp::TcpListener;
-use tokio::prelude::*;
+use std::{env, net, path, time};
+use tokio_util::codec::{Framed, LinesCodec};
+use tokio::{net::TcpListener, stream::StreamExt};
 
-#[macro_use]
-extern crate futures;
 #[macro_use]
 extern crate lazy_static;
 
@@ -13,9 +10,6 @@ mod message;
 mod responses;
 mod settings;
 mod smtp;
-
-#[cfg(test)]
-mod dummy_socket;
 
 /// Get the address to listen to.
 fn get_listen_address(protocol: u8, port: u16) -> net::SocketAddr {
@@ -40,67 +34,41 @@ fn load_settings() -> Result<settings::Settings, Box<dyn std::error::Error>> {
     }
 }
 
+/// Load settings from a toml file if it has beet specified.
+/// Else use the defaults.
 lazy_static! {
     static ref SETTINGS:settings::Settings = load_settings().unwrap();
 }
 
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// The main function.
+/// Sets up the socket and handles incoming requests.
+#[tokio::main]
+async fn main() {
 
     // Setup the socket.
     let addr = get_listen_address(SETTINGS.protocol, SETTINGS.port);
-    let listener = TcpListener::bind(&addr)?;
-    let incoming = listener.incoming();
+    let mut listener = TcpListener::bind(&addr).await.unwrap();
 
-    // Run up the server.
-    let server = incoming
-        .map_err(|e| eprintln!("Accept failed = {:?}", e))
-        .for_each(|socket| {
-            // TODO : SMTP line endings are CRLF.
-            // We are going to need to create our own Codec that can handle this specifically.
-            let framed = Framed::new(socket, LinesCodec::new());
-
-            let handle = smtp::Smtp::new(&SETTINGS, framed);
-
-            tokio::spawn(
-                handle
-                    .and_then(|message| {
-                        // Ensure that a message has actually been created.
-                        // Error if it hasn't
-                        match message {
-                            Some(message) => future::ok(message),
-                            None => future::err(io::Error::new(
-                                io::ErrorKind::Other,
-                                "No message created",
-                            )),
-                        }
-                    })
-                    .and_then(|message| {
-                        // Save the message to a file.
-                        let now = time::SystemTime::now();
-                        match now.duration_since(time::SystemTime::UNIX_EPOCH) {
-                            Ok(n) => future::Either::A(
-                                message.save_to_file(format!("./received/{}.eml", n.as_millis())),
-                            ),
-                            Err(_) => future::Either::B(future::err(io::Error::new(
-                                io::ErrorKind::Other,
-                                "We have gone back in time!",
-                            ))),
-                        }
-                    })
-                    .map(|message| {
-                        println!(
-                            "{} : Email sent to {:?}",
-                            message.saved.unwrap_or("Err".to_string()),
-                            message.to
-                        )
-                    })
-                    .map_err(|err| eprintln!("Error {:?}", err)),
-            )
-        });
-
-    println!("Listening on {}", SETTINGS.port);
-    tokio::run(server);
-
-    Ok(())
+    while let Some(stream) = listener.next().await {
+        match stream {
+            Ok(stream) => {
+                let framed = Framed::new(stream, LinesCodec::new());
+                let message = smtp::converse(framed, &SETTINGS).await.unwrap();
+                let now = time::SystemTime::now();
+                match now.duration_since(time::SystemTime::UNIX_EPOCH) {
+                    Ok(n) => {
+                        message.save_to_file(format!("./received/{}.eml", n.as_millis())).await.unwrap();
+                    },
+                    Err(_) => {
+                        // TODO Insert some kind of McFly joke...
+                        eprintln!("We have gone back in time!");
+                    },
+                }
+            }
+            Err(e) => {
+                eprintln!("Connection failed {}", e);
+            }
+        }
+    }
 }
