@@ -34,8 +34,8 @@ fn load_settings() -> Result<settings::Settings, Box<dyn std::error::Error>> {
     }
 }
 
-/// Load settings from a toml file if it has beet specified.
-/// Else use the defaults.
+// Load settings from a toml file if it has beet specified.
+// Else use the defaults.
 lazy_static! {
     static ref SETTINGS:settings::Settings = load_settings().unwrap();
 }
@@ -54,21 +54,25 @@ async fn main() {
         match stream {
             Ok(stream) => {
                 let framed = Framed::new(stream, LinesCodec::new());
-                let message = smtp::converse(framed, &SETTINGS).await.unwrap();
-                let now = time::SystemTime::now();
-                match now.duration_since(time::SystemTime::UNIX_EPOCH) {
-                    Ok(n) => {
-                        message.save_to_file(format!("./received/{}.eml", n.as_millis())).await.unwrap();
-                    },
-                    Err(_) => {
-                        // TODO Insert some kind of McFly joke...
-                        eprintln!("We have gone back in time!");
-                    },
+                match smtp::converse(framed, &SETTINGS).await {
+                    Ok (message) => { 
+                        let now = time::SystemTime::now();
+                        match now.duration_since(time::SystemTime::UNIX_EPOCH) {
+                            Ok(n) => {
+                                message.save_to_file(format!("./received/{}.eml", n.as_millis())).await.unwrap();
+                                println!("New email: {}", n.as_millis());
+                            },
+                            Err(_) => {
+                                // TODO Insert some kind of McFly joke...
+                                eprintln!("We have gone back in time!");
+                            },
+                        }
+                    }
+                    Err (err) => eprintln!("{}", err)
                 }
             }
-            Err(e) => {
-                eprintln!("Connection failed {}", e);
-            }
+
+            Err(e) => eprintln!("Connection failed {}", e)
         }
     }
 }

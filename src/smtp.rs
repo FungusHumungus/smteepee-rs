@@ -4,10 +4,22 @@ use crate::responses::Response;
 use crate::settings::Settings;
 use base64;
 use futures::sink::*;
-use std::error;
+use std::{error, fmt};
 use tokio::prelude::*;
 use tokio::stream::StreamExt;
 use tokio_util::codec::{Framed, LinesCodec};
+
+#[derive (Debug)]
+pub struct ConnectionError;
+
+impl fmt::Display for ConnectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Connection broken")
+    }
+}
+
+impl error::Error for ConnectionError {}
+    
 
 #[derive(Clone, Copy)]
 pub enum Authentication {
@@ -15,7 +27,7 @@ pub enum Authentication {
     ReceivePlainAuth,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum State {
     SendGreeting,
     ReceiveGreeting,
@@ -46,29 +58,32 @@ where
     let mut stage = Authentication::ReceiveAuthCommand;
 
     loop {
-        if let Some(line) = stream.next().await {
-            match stage {
-                Authentication::ReceiveAuthCommand => match Command::from_str(&line?) {
-                    Some(Command::AUTH(_)) => {
-                        respond(&mut stream, Response::_334_Authenticate).await?;
-                        stage = Authentication::ReceivePlainAuth;
-                    }
-                    _ => {
-                        respond(&mut stream, Response::_503_BadSequence).await?;
-                        stage = Authentication::ReceiveAuthCommand;
-                    }
-                },
-
-                Authentication::ReceivePlainAuth => {
-                    if base64::encode(&settings.password) == line? {
-                        respond(&mut stream, Response::_235_AuthenticationSuccessful).await?;
-                        return Ok(true);
-                    } else {
-                        respond(&mut stream, Response::_535_FailedAuthentication).await?;
-                        stage = Authentication::ReceiveAuthCommand;
+        match stream.next().await {
+            Some(line) => {
+                match stage {
+                    Authentication::ReceiveAuthCommand => match Command::from_str(&line?) {
+                        Some(Command::AUTH(_)) => {
+                            respond(&mut stream, Response::_334_Authenticate).await?;
+                            stage = Authentication::ReceivePlainAuth;
+                        }
+                        _ => {
+                            respond(&mut stream, Response::_503_BadSequence).await?;
+                            stage = Authentication::ReceiveAuthCommand;
+                        }
+                    },
+                    
+                    Authentication::ReceivePlainAuth => {
+                        if base64::encode(&settings.password) == line? {
+                            respond(&mut stream, Response::_235_AuthenticationSuccessful).await?;
+                            return Ok(true);
+                        } else {
+                            respond(&mut stream, Response::_535_FailedAuthentication).await?;
+                            stage = Authentication::ReceiveAuthCommand;
+                        }
                     }
                 }
             }
+            None => return Err(Box::new(ConnectionError))
         }
     }
 }
@@ -89,94 +104,103 @@ pub async fn converse<T: AsyncRead + AsyncWrite + Unpin>(
             }
 
             State::ReceiveGreeting => {
-                if let Some(line) = stream.next().await {
-                    // The first command we must recieve must be an EHLO or a HELO command.
-                    // Then if it is correct we can get on with the main command loop.
-                    match Command::from_str(&line?) {
-                        Some(Command::HELO(_)) => {
-                            respond(
-                                &mut stream,
-                                Response::_250_Completed(&format!(
-                                    "{}, I hope this day finds you well.",
-                                    settings.domain
-                                )),
-                            )
-                            .await?;
-                            state = State::Accept;
-                        }
-                        Some(Command::EHLO(_)) => {
-                            respond(
-                                &mut stream,
-                                Response::_250_Completed(&format!(
-                                    "{}, I hope this day finds you well.",
-                                    settings.domain
-                                )),
-                            )
-                            .await?;
-                            respond(&mut stream, Response::_250_Completed("AUTH PLAIN")).await?;
-
-                            // Authentication must pass before we can get beyond this stage.
-                            if authentication(&mut stream, settings).await? == true {
+                match stream.next().await {
+                    Some(line) => {
+                        // The first command we must recieve must be an EHLO or a HELO command.
+                        // Then if it is correct we can get on with the main command loop.
+                        match Command::from_str(&line?) {
+                            Some(Command::HELO(_)) => {
+                                respond(
+                                    &mut stream,
+                                    Response::_250_Completed(&format!(
+                                        "{}, I hope this day finds you well.",
+                                        settings.domain
+                                    )),
+                                )
+                                    .await?;
                                 state = State::Accept;
-                            } else {
-                                state = State::End;
+                            }
+                            Some(Command::EHLO(_)) => {
+                                respond(
+                                    &mut stream,
+                                    Response::_250_Completed(&format!(
+                                        "{}, I hope this day finds you well.",
+                                        settings.domain
+                                    )),
+                                )
+                                    .await?;
+                                respond(&mut stream, Response::_250_Completed("AUTH PLAIN")).await?;
+
+                                // Authentication must pass before we can get beyond this stage.
+                                if authentication(&mut stream, settings).await? == true {
+                                    state = State::Accept;
+                                } else {
+                                    state = State::End;
+                                }
+                            }
+                            Some(_) => {
+                                respond(&mut stream, Response::_503_BadSequence).await?;
+                                state = State::ReceiveGreeting;
+                            }
+                            None => {
+                                respond(&mut stream, Response::_502_CommandNotImplemented).await?;
+                                state = State::ReceiveGreeting;
                             }
                         }
-                        Some(_) => {
-                            respond(&mut stream, Response::_503_BadSequence).await?;
-                            state = State::ReceiveGreeting;
-                        }
-                        None => {
-                            respond(&mut stream, Response::_502_CommandNotImplemented).await?;
-                            state = State::ReceiveGreeting;
-                        }
-                    }
+                    },
+                    None => return Err(Box::new(ConnectionError))
                 }
             }
 
             State::Accept => {
-                if let Some(line) = stream.next().await {
-                    // The main command loop over which the email contents are sent.
-                    match Command::from_str(&line?) {
-                        Some(Command::MAIL(from)) => {
-                            message.from = Some(from);
-                            respond(&mut stream, Response::_250_Completed("OK")).await?;
-                        }
-                        Some(Command::RCPT(to)) => {
-                            message.to.push(to);
-                            respond(&mut stream, Response::_250_Completed("OK")).await?;
-                        }
-                        Some(Command::VRFY(addr)) => {
-                            // Currently we verify all addresses as ok..
-                            respond(&mut stream, Response::_250_Completed(&addr)).await?;
-                        }
-                        Some(Command::DATA) => {
-                            respond(&mut stream, Response::_354_StartMailInput).await?;
-                            state = State::AcceptData;
-                        }
-                        Some(Command::QUIT) => {
-                            respond(&mut stream, Response::_221_ServiceClosing).await?;
-                            state = State::End;
-                        }
-                        _ => {
-                            respond(&mut stream, Response::_503_BadSequence).await?;
-                            state = State::Rejected;
+                match stream.next().await {
+                    Some (line) => {
+                        // The main command loop over which the email contents are sent.
+                        match Command::from_str(&line?) {
+                            Some(Command::MAIL(from)) => {
+                                message.from = Some(from);
+                                respond(&mut stream, Response::_250_Completed("OK")).await?;
+                            }
+                            Some(Command::RCPT(to)) => {
+                                message.to.push(to);
+                                respond(&mut stream, Response::_250_Completed("OK")).await?;
+                            }
+                            Some(Command::VRFY(addr)) => {
+                                // Currently we verify all addresses as ok..
+                                respond(&mut stream, Response::_250_Completed(&addr)).await?;
+                            }
+                            Some(Command::DATA) => {
+                                respond(&mut stream, Response::_354_StartMailInput).await?;
+                                state = State::AcceptData;
+                            }
+                            Some(Command::QUIT) => {
+                                respond(&mut stream, Response::_221_ServiceClosing).await?;
+                                state = State::End;
+                            }
+                            _ => {
+                                respond(&mut stream, Response::_503_BadSequence).await?;
+                                state = State::Rejected;
+                            }
                         }
                     }
+                    None => return Err(Box::new(ConnectionError))
                 }
             }
 
             State::AcceptData => {
                 // In this state we are getting the main body text of the email, one line at a time.
                 // When we get a "." by itself we are finished.
-                if let Some(msg) = stream.next().await {
-                    let msg = msg?;
-                    if msg == "." {
-                        respond(&mut stream, Response::_250_Completed("OK")).await?;
-                        state = State::Accept;
-                    } else {
-                        message.data.push(msg);
+                match stream.next().await {
+                    Some(msg) => {
+                        let msg = msg?;
+                        if msg == "." {
+                            respond(&mut stream, Response::_250_Completed("OK")).await?;
+                            state = State::Accept;
+                        } else {
+                            message.data.push(msg);
+                        }
                     }
+                    None => return Err(Box::new(ConnectionError))
                 }
             }
 
@@ -185,9 +209,7 @@ pub async fn converse<T: AsyncRead + AsyncWrite + Unpin>(
                 state = State::End;
             }
 
-            State::End => {
-                return Ok(message);
-            }
+            State::End => return Ok(message)
         }
     }
 }
